@@ -21,12 +21,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"slices"
 	"sort"
 	"time"
 
 	backoff "github.com/cenkalti/backoff/v5"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/ingress-gce/pkg/apis/svcneg/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -48,6 +54,7 @@ const (
 var (
 	errConfigInvalid = errors.New("autoneg configuration invalid")
 	errJSONInvalid   = errors.New("json malformed")
+	zoneRE           = regexp.MustCompile(`zones/([^/]+)`)
 )
 
 type errNotFound struct {
@@ -463,7 +470,8 @@ func validateNewConfig(config AutonegConfig) error {
 	return nil
 }
 
-func getStatuses(namespace string, name string, annotations map[string]string, r *ServiceReconciler) (s Statuses, valid bool, err error) {
+func getStatuses(ctx context.Context, namespace string, name string, annotations map[string]string, r *ServiceReconciler) (s Statuses, valid bool, err error) {
+	logger := log.FromContext(ctx)
 	// Read the current cloud.google.com/neg annotation
 	tmp, ok := annotations[negAnnotation]
 	if ok {
@@ -596,6 +604,47 @@ func getStatuses(namespace string, name string, annotations map[string]string, r
 		if err = json.Unmarshal([]byte(tmp), &s.negStatus); err != nil {
 			return
 		}
+		// Check if we should use ServiceNetworkEndpointGroup custom resource to get the NEG zones.
+		if r.UseSvcNeg {
+			logger.Info("Getting zones from svcneg")
+			zones := []string{}
+			for _, neg := range s.negStatus.NEGs {
+				svcNeg := v1beta1.ServiceNetworkEndpointGroup{}
+				err = r.Get(ctx, client.ObjectKey{
+					Namespace: namespace, Name: neg,
+				}, &svcNeg)
+				if apierrors.IsNotFound(err) {
+					logger.Info("SvcNeg not found", "neg", neg)
+					err = nil
+					continue
+				}
+				if err != nil {
+					logger.Error(err, "Failed to get svcneg")
+					return
+				}
+				for _, neg := range svcNeg.Status.NetworkEndpointGroups {
+					negZone := zone(neg)
+					if !slices.Contains(zones, negZone) {
+						zones = append(zones, negZone)
+					}
+				}
+			}
+			// Update the zones.
+			logger.Info("Got zones from svcnegs", "zones", zones)
+			s.negStatus.Zones = zones
+		}
 	}
+
 	return
+}
+
+func zone(ref v1beta1.NegObjectReference) string {
+	// Of the format: https://www.googleapis.com/compute/beta/projects/<project-id>/zones/<zone>/networkEndpointGroups/<neg>
+	matches := zoneRE.FindStringSubmatch(ref.SelfLink)
+	// The first submatch (index 0) is the entire matched string "zones/us-central1-c"
+	// The second submatch (index 1) is the content of the first capturing group "us-central1-c"
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
 }
